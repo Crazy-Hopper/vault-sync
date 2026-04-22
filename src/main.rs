@@ -1,17 +1,19 @@
-use std::{thread};
+use std::env;
 use std::error::Error;
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
+use std::str::FromStr;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::thread::JoinHandle;
 
-use clap::{crate_authors, crate_version, Arg, App};
+use clap::{crate_authors, crate_version, App, Arg};
 use log::{error, info};
 use simplelog::*;
 
+use crate::config::{get_backends, EngineVersion};
 use config::{VaultHost, VaultSyncConfig};
 use vault::VaultClient;
-use crate::config::{EngineVersion, get_backends};
 
 mod audit;
 mod config;
@@ -19,50 +21,101 @@ mod sync;
 mod vault;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    TermLogger::init(LevelFilter::Info, Config::default(), TerminalMode::Mixed, ColorChoice::Auto)?;
+    let log_level = env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| LevelFilter::from_str(&s).ok())
+        .unwrap_or(LevelFilter::Info);
+
+    TermLogger::init(
+        log_level,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )?;
 
     let matches = App::new("vault-sync")
         .author(crate_authors!())
         .version(crate_version!())
-        .arg(Arg::with_name("config")
-            .long("config")
-            .value_name("FILE")
-            .help("Configuration file")
-            .default_value("./vault-sync.yaml")
-            .takes_value(true))
-        .arg(Arg::with_name("dry-run")
-            .long("dry-run")
-            .help("Do not do any changes with the destination Vault"))
-        .arg(Arg::with_name("once")
-            .long("once")
-            .help("Run the full sync once, then exit"))
+        .arg(
+            Arg::with_name("config")
+                .long("config")
+                .value_name("FILE")
+                .help("Configuration file")
+                .default_value("./vault-sync.yaml")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("dry-run")
+                .long("dry-run")
+                .help("Do not do any changes with the destination Vault"),
+        )
+        .arg(
+            Arg::with_name("once")
+                .long("once")
+                .help("Run the full sync once, then exit"),
+        )
+        .arg(
+            Arg::with_name("no-full-sync")
+                .long("no-full-sync")
+                .help("Disable periodic full sync"),
+        )
         .get_matches();
 
     let config = load_config(matches.value_of("config").unwrap())?;
-    let (tx, rx): (mpsc::Sender<sync::SecretOp>, mpsc::Receiver<sync::SecretOp>) = mpsc::channel();
+    let (audit_tx, audit_rx): (mpsc::Sender<sync::SecretOp>, mpsc::Receiver<sync::SecretOp>) =
+        mpsc::channel();
+    let (full_tx, full_rx): (
+        mpsc::SyncSender<sync::SecretOp>,
+        mpsc::Receiver<sync::SecretOp>,
+    ) = mpsc::sync_channel(100);
 
-    let log_sync = match &config.bind {
-        Some(_) => Some(log_sync_worker(&config, tx.clone())?),
-        None => None,
+    let log_sync = if !matches.is_present("once") {
+        match &config.bind {
+            Some(_) => Some(log_sync_worker(&config, audit_tx)?),
+            None => None,
+        }
+    } else {
+        None
     };
     info!("Connecting to {}", &config.src.host.url);
-    let src_client = vault_client(&config.src.host, &config.src.version, config.src.namespace.clone())?;
+    let src_client = vault_client(
+        &config.src.host,
+        &config.src.version,
+        config.src.namespace.clone(),
+    )?;
     let shared_src_client = Arc::new(Mutex::new(src_client));
-    let src_token = token_worker(&config.src.host, &config.src.version, shared_src_client.clone(), config.src.namespace.clone());
-
-    info!("Connecting to {}", &config.dst.host.url);
-    let dst_client = vault_client(&config.dst.host, &config.dst.version, config.dst.namespace.clone())?;
-    let shared_dst_client = Arc::new(Mutex::new(dst_client));
-    let dst_token = token_worker(&config.dst.host, &config.dst.version, shared_dst_client.clone(), config.dst.namespace.clone());
-
-    info!(
-        "Audit device {} exists: {}",
-        &config.id,
-        sync::audit_device_exists(&config.id, shared_src_client.clone()),
+    let src_token = token_worker(
+        &config.src.host,
+        &config.src.version,
+        shared_src_client.clone(),
+        config.src.namespace.clone(),
     );
 
+    info!("Connecting to {}", &config.dst.host.url);
+    let dst_client = vault_client(
+        &config.dst.host,
+        &config.dst.version,
+        config.dst.namespace.clone(),
+    )?;
+    let shared_dst_client = Arc::new(Mutex::new(dst_client));
+    let dst_token = token_worker(
+        &config.dst.host,
+        &config.dst.version,
+        shared_dst_client.clone(),
+        config.dst.namespace.clone(),
+    );
+
+    if !matches.is_present("once") {
+        info!(
+            "Audit device {} exists: {}",
+            &config.id,
+            sync::audit_device_exists(&config.id, shared_src_client.clone()),
+        );
+    }
+
     let sync = sync_worker(
-        rx,
+        audit_rx,
+        full_rx,
         &config,
         shared_src_client.clone(),
         shared_dst_client.clone(),
@@ -73,8 +126,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut join_handlers = vec![sync];
 
     if !matches.is_present("once") {
-        let full_sync = full_sync_worker(&config, shared_src_client.clone(), tx.clone());
-        join_handlers.push(full_sync);
+        if !matches.is_present("no-full-sync") {
+            let full_sync = full_sync_worker(&config, shared_src_client.clone(), full_tx);
+            join_handlers.push(full_sync);
+        }
         join_handlers.push(src_token);
         join_handlers.push(dst_token);
         if log_sync.is_some() {
@@ -82,7 +137,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     } else {
         let backends = get_backends(&config.src.backend);
-        sync::full_sync(&config.src.prefix, &backends, shared_src_client.clone(), tx.clone());
+        sync::full_sync(
+            &config.src.prefix,
+            &backends,
+            &config.ignore,
+            shared_src_client.clone(),
+            full_tx,
+        );
     };
 
     // Join all threads
@@ -96,9 +157,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn load_config(file_name: &str) -> Result<VaultSyncConfig, Box<dyn Error>> {
     match VaultSyncConfig::from_file(file_name) {
         Ok(config) => {
-            info!("Configuration from {}:\n{}", file_name, serde_json::to_string_pretty(&config).unwrap());
+            info!(
+                "Configuration from {}:\n{}",
+                file_name,
+                serde_json::to_string_pretty(&config).unwrap()
+            );
             Ok(config)
-        },
+        }
         Err(error) => {
             error!("Failed to load configuration file {}: {}", file_name, error);
             Err(error)
@@ -106,11 +171,13 @@ fn load_config(file_name: &str) -> Result<VaultSyncConfig, Box<dyn Error>> {
     }
 }
 
-fn vault_client(host: &VaultHost, version: &EngineVersion, namespace: Option<String>) -> Result<VaultClient, Box<dyn Error>> {
+fn vault_client(
+    host: &VaultHost,
+    version: &EngineVersion,
+    namespace: Option<String>,
+) -> Result<VaultClient, Box<dyn Error>> {
     match vault::vault_client(host, version, namespace) {
-        Ok(client) => {
-            Ok(client)
-        },
+        Ok(client) => Ok(client),
         Err(error) => {
             error!("Failed to connect to {}: {}", &host.url, error);
             Err(error.into())
@@ -118,7 +185,12 @@ fn vault_client(host: &VaultHost, version: &EngineVersion, namespace: Option<Str
     }
 }
 
-fn token_worker(host: &VaultHost, version: &EngineVersion, client: Arc<Mutex<VaultClient>>, namespace: Option<String>) -> JoinHandle<()> {
+fn token_worker(
+    host: &VaultHost,
+    version: &EngineVersion,
+    client: Arc<Mutex<VaultClient>>,
+    namespace: Option<String>,
+) -> JoinHandle<()> {
     let host = host.clone();
     let version = version.clone();
     thread::spawn(move || {
@@ -127,7 +199,8 @@ fn token_worker(host: &VaultHost, version: &EngineVersion, client: Arc<Mutex<Vau
 }
 
 fn sync_worker(
-    rx: mpsc::Receiver<sync::SecretOp>,
+    audit_rx: mpsc::Receiver<sync::SecretOp>,
+    full_rx: mpsc::Receiver<sync::SecretOp>,
     config: &VaultSyncConfig,
     src_client: Arc<Mutex<VaultClient>>,
     dst_client: Arc<Mutex<VaultClient>>,
@@ -137,11 +210,16 @@ fn sync_worker(
     info!("Dry run: {}", dry_run);
     let config = config.clone();
     thread::spawn(move || {
-        sync::sync_worker(rx, &config, src_client, dst_client, dry_run, run_once);
+        sync::sync_worker(
+            audit_rx, full_rx, &config, src_client, dst_client, dry_run, run_once,
+        );
     })
 }
 
-fn log_sync_worker(config: &VaultSyncConfig, tx: mpsc::Sender<sync::SecretOp>) -> Result<JoinHandle<()>, std::io::Error> {
+fn log_sync_worker(
+    config: &VaultSyncConfig,
+    tx: mpsc::Sender<sync::SecretOp>,
+) -> Result<JoinHandle<()>, std::io::Error> {
     let addr = &config.bind.clone().unwrap();
     let config = config.clone();
     info!("Listening on {}", addr);
@@ -163,8 +241,8 @@ fn log_sync_worker(config: &VaultSyncConfig, tx: mpsc::Sender<sync::SecretOp>) -
 fn full_sync_worker(
     config: &VaultSyncConfig,
     client: Arc<Mutex<VaultClient>>,
-    tx: mpsc::Sender<sync::SecretOp>
-) -> thread::JoinHandle<()>{
+    tx: mpsc::SyncSender<sync::SecretOp>,
+) -> thread::JoinHandle<()> {
     let config = config.clone();
     thread::spawn(move || {
         sync::full_sync_worker(&config, client, tx);

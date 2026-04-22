@@ -19,7 +19,7 @@ pub enum VaultAuthMethod {
         role_id: String,
         #[serde(serialize_with = "sanitize")]
         secret_id: String,
-    }
+    },
 }
 
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Clone, Debug)]
@@ -77,6 +77,8 @@ pub struct VaultSyncConfig {
     pub id: String,
     pub full_sync_interval: u64,
     pub bind: Option<String>,
+    #[serde(default)]
+    pub ignore: Vec<String>,
     pub src: VaultSource,
     pub dst: VaultDestination,
 }
@@ -142,19 +144,19 @@ impl VaultSyncConfig {
             Backend::Backend(_) => match &dst_backend {
                 Backend::Backends(_) => {
                     return Err(ConfigError::OneToManyNotSupported.into());
-                },
-                _ => {},
+                }
+                _ => {}
             },
             Backend::Backends(src_backends) => match &dst_backend {
                 Backend::Backend(_) => {
                     return Err(ConfigError::ManyToOneNotSupported.into());
-                },
+                }
                 Backend::Backends(dst_backends) => {
                     if src_backends.len() != dst_backends.len() {
                         return Err(ConfigError::DifferentNumberOfBackends.into());
                     }
                 }
-            }
+            },
         }
         Ok(())
     }
@@ -166,10 +168,10 @@ impl VaultAuthMethod {
         let role_id = env::var(format!("{}_ROLE_ID", prefix));
         let secret_id = env::var(format!("{}_SECRET_ID", prefix));
         if let Ok(token) = token {
-            return Ok(VaultAuthMethod::TokenAuth { token })
+            return Ok(VaultAuthMethod::TokenAuth { token });
         }
         if let (Ok(role_id), Ok(secret_id)) = (role_id, secret_id) {
-            return Ok(VaultAuthMethod::AppRoleAuth { role_id, secret_id })
+            return Ok(VaultAuthMethod::AppRoleAuth { role_id, secret_id });
         }
         Err(ConfigError::AuthRequired.into())
     }
@@ -178,20 +180,24 @@ impl VaultAuthMethod {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match *self {
-            ConfigError::AuthRequired =>
-                write!(f, "Vault token or both app role id and secret id are required"),
-            ConfigError::OneToManyNotSupported =>
-                write!(f, "Syncing one backend to many not supported"),
-            ConfigError::ManyToOneNotSupported =>
-                write!(f, "Syncing many backends to one not supported"),
-            ConfigError::DifferentNumberOfBackends =>
-                write!(f, "Different number of backends for source and destination"),
+            ConfigError::AuthRequired => write!(
+                f,
+                "Vault token or both app role id and secret id are required"
+            ),
+            ConfigError::OneToManyNotSupported => {
+                write!(f, "Syncing one backend to many not supported")
+            }
+            ConfigError::ManyToOneNotSupported => {
+                write!(f, "Syncing many backends to one not supported")
+            }
+            ConfigError::DifferentNumberOfBackends => {
+                write!(f, "Different number of backends for source and destination")
+            }
         }
     }
 }
 
-impl Error for ConfigError {
-}
+impl Error for ConfigError {}
 
 fn sanitize<S>(_: &str, s: S) -> Result<S::Ok, S::Error>
 where
@@ -202,8 +208,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::config::{get_backends, ConfigError, EngineVersion, VaultSyncConfig};
     use std::error::Error;
-    use crate::config::{EngineVersion, VaultSyncConfig, get_backends, ConfigError};
 
     #[test]
     fn test_load() -> Result<(), Box<dyn Error>> {
@@ -228,12 +234,7 @@ mod tests {
         Ok(())
     }
 
-    fn render_yaml(
-        src: Option<&str>,
-        dst: Option<&str>,
-        src_key: &str,
-        dst_key: &str,
-    ) -> String {
+    fn render_yaml(src: Option<&str>, dst: Option<&str>, src_key: &str, dst_key: &str) -> String {
         format!(
             r#"
                 id: vault-sync-id
@@ -268,8 +269,14 @@ mod tests {
         let mut config: VaultSyncConfig = serde_yaml::from_str(&yaml)?;
         config.defaults()?;
         config.validate()?;
-        assert_eq!(get_backends(&config.src.backend).first().unwrap(), expected_src);
-        assert_eq!(get_backends(&config.dst.backend).first().unwrap(), expected_dst);
+        assert_eq!(
+            get_backends(&config.src.backend).first().unwrap(),
+            expected_src
+        );
+        assert_eq!(
+            get_backends(&config.dst.backend).first().unwrap(),
+            expected_dst
+        );
         Ok(())
     }
 
@@ -295,7 +302,12 @@ mod tests {
         test_single_backend(None, Some("custom"), "secret", "custom")?;
         test_single_backend(Some("src"), Some("dst"), "src", "dst")?;
         test_many_backends(Some("[foo, baz]"), None, &["foo", "baz"], &["foo", "baz"])?;
-        test_many_backends(Some("[foo, baz]"), Some("[bar, qux]"), &["foo", "baz"], &["bar", "qux"])?;
+        test_many_backends(
+            Some("[foo, baz]"),
+            Some("[bar, qux]"),
+            &["foo", "baz"],
+            &["bar", "qux"],
+        )?;
         Ok(())
     }
 
@@ -306,7 +318,10 @@ mod tests {
         config.defaults()?;
         let result = config.validate();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), ConfigError::OneToManyNotSupported.to_string());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            ConfigError::OneToManyNotSupported.to_string()
+        );
         Ok(())
     }
 
@@ -317,7 +332,10 @@ mod tests {
         config.defaults()?;
         let result = config.validate();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), ConfigError::ManyToOneNotSupported.to_string());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            ConfigError::ManyToOneNotSupported.to_string()
+        );
         Ok(())
     }
 
@@ -328,7 +346,10 @@ mod tests {
         config.defaults()?;
         let result = config.validate();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), ConfigError::DifferentNumberOfBackends.to_string());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            ConfigError::DifferentNumberOfBackends.to_string()
+        );
         Ok(())
     }
 }

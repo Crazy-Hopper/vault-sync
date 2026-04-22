@@ -16,6 +16,7 @@ pub struct Request {
     pub path: String,
 }
 
+#[allow(dead_code)]
 #[derive(Serialize, Debug)]
 pub struct CreateAuditDeviceRequest {
     #[serde(rename = "type")]
@@ -23,6 +24,7 @@ pub struct CreateAuditDeviceRequest {
     pub options: AuditDeviceOptions,
 }
 
+#[allow(dead_code)]
 #[derive(Serialize, Debug)]
 pub struct AuditDeviceOptions {
     pub address: String,

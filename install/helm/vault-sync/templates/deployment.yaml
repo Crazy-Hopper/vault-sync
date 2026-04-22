@@ -42,7 +42,7 @@ spec:
             {{- end }}
           {{- if .Values.vaultSync.bind }}
           ports:
-            - name: tcp
+            - name: http
               containerPort: {{ (split ":" .Values.vaultSync.bind)._1 }}
               protocol: TCP
           {{- end }}
@@ -50,7 +50,7 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
           env:
             - name: RUST_LOG
-              value: info'
+              value: info
           {{- if not .Values.existingSecretName }}
             {{- $secretName := include "vault-sync.fullname" . }}
             {{- range $key, $_ := .Values.secrets }}

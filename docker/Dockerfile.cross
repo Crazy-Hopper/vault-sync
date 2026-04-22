@@ -1,0 +1,28 @@
+# Build stage
+FROM rust:1.93.0 AS builder
+
+# Increase stack size to prevent SIGSEGV in QEMU
+ENV RUST_MIN_STACK=16777216
+
+# Install cross-compilation toolchain for amd64
+RUN apt-get update && apt-get install -y gcc-x86-64-linux-gnu
+
+# Add the target
+RUN rustup target add x86_64-unknown-linux-gnu
+
+# Set the linker for the target
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
+
+WORKDIR /usr/src/vault-sync
+COPY . .
+
+# Build for the target architecture
+RUN cargo build --release --target x86_64-unknown-linux-gnu
+
+# Final stage (amd64)
+FROM --platform=linux/amd64 debian:bookworm-slim
+RUN apt-get update && apt-get install -y openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /usr/src/vault-sync/target/x86_64-unknown-linux-gnu/release/vault-sync /usr/local/bin/vault-sync
+# Smoke check - this will run under emulation, but it's just a version check
+RUN /usr/local/bin/vault-sync --version
+CMD ["vault-sync"]

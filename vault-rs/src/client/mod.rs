@@ -18,6 +18,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::TryInto;
 use chrono::{DateTime, FixedOffset, Utc};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json;
 use std::time::Duration;
 use url::Url;
@@ -28,7 +29,7 @@ pub mod error;
 /// Secrets engine.
 ///
 /// See https://developer.hashicorp.com/vault/api-docs/secret/kv.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SecretsEngine {
     /// KV secrets engine, version 1.
     /// https://developer.hashicorp.com/vault/api-docs/secret/kv/kv-v1
@@ -36,6 +37,27 @@ pub enum SecretsEngine {
     /// KV secrets engine, version 2.
     /// https://developer.hashicorp.com/vault/api-docs/secret/kv/kv-v2
     KVV2,
+}
+
+/// The set of characters to percent-encode in Vault paths.
+/// We encode characters that have special meaning in URLs or are known to cause issues.
+const ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`')
+    .add(b'?')
+    .add(b'{')
+    .add(b'}');
+
+fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| utf8_percent_encode(segment, ENCODE_SET).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Lease duration.
@@ -317,9 +339,34 @@ pub struct SecretDataWrapper<D> {
 }
 
 /// Actual Secret data, used in `VaultResponse`
+#[allow(dead_code)]
 #[derive(Deserialize, Serialize, Debug)]
 struct SecretData {
     value: String,
+}
+
+/// Metadata for a specific version of a secret (KV v2)
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SecretVersionMetadata {
+    /// When the version was created
+    pub created_time: String,
+    /// When the version was soft-deleted (if applicable)
+    pub deletion_time: String,
+    /// Whether the version has been permanently destroyed
+    pub destroyed: bool,
+}
+
+/// Metadata for a secret (KV v2)
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SecretMetadata {
+    /// The oldest available version number
+    pub oldest_version: u64,
+    /// The current (latest) version number
+    pub current_version: u64,
+    /// Maximum number of versions to keep
+    pub max_versions: u64,
+    /// Map of version number strings to their metadata
+    pub versions: HashMap<String, SecretVersionMetadata>,
 }
 
 /// Transit decrypted data, used in `VaultResponse`
@@ -674,7 +721,11 @@ pub enum EndpointResponse<D> {
 
 impl VaultClient<TokenData> {
     /// Construct a `VaultClient` from an existing vault token
-    pub fn new<U, T: Into<String>>(host: U, token: T, namespace: Option<String>) -> Result<VaultClient<TokenData>>
+    pub fn new<U, T: Into<String>>(
+        host: U,
+        token: T,
+        namespace: Option<String>,
+    ) -> Result<VaultClient<TokenData>>
     where
         U: TryInto<Url, Err = Error>,
     {
@@ -850,7 +901,11 @@ impl VaultClient<()> {
     ///
     /// A common use case for this method is when a `wrapping_token` has been received and you want
     /// to query the `sys/wrapping/unwrap` endpoint.
-    pub fn new_no_lookup<U, S: Into<String>>(host: U, token: S, namespace: Option<String>) -> Result<VaultClient<()>>
+    pub fn new_no_lookup<U, S: Into<String>>(
+        host: U,
+        token: S,
+        namespace: Option<String>,
+    ) -> Result<VaultClient<()>>
     where
         U: TryInto<Url, Err = Error>,
     {
@@ -891,6 +946,11 @@ where
     /// Set the secrets engine to be used by this VaultClient
     pub fn secrets_engine(&mut self, secrets_engine: SecretsEngine) {
         self.secrets_engine = secrets_engine
+    }
+
+    /// Get the secrets engine used by this VaultClient
+    pub fn get_secrets_engine(&self) -> SecretsEngine {
+        self.secrets_engine
     }
 
     /// Renew lease for `VaultClient`'s token and updates the
@@ -1130,17 +1190,22 @@ where
         S1: Into<String>,
         S2: Serialize,
     {
+        let secret_name = secret_name.into();
         let endpoint = match self.secrets_engine {
-            SecretsEngine::KVV1 => format!("/v1/{}/{}", self.secret_backend, secret_name.into()),
-            SecretsEngine::KVV2 => format!("/v1/{}/data/{}", self.secret_backend, secret_name.into()),
+            SecretsEngine::KVV1 => format!(
+                "/v1/{}/{}",
+                encode_path(&self.secret_backend),
+                encode_path(&secret_name)
+            ),
+            SecretsEngine::KVV2 => format!(
+                "/v1/{}/data/{}",
+                encode_path(&self.secret_backend),
+                encode_path(&secret_name)
+            ),
         };
         let json = match self.secrets_engine {
-            SecretsEngine::KVV1 => {
-                serde_json::to_string(&secret)?
-            },
-            SecretsEngine::KVV2 => {
-                serde_json::to_string(&SecretContainer { data: secret })?
-            },
+            SecretsEngine::KVV1 => serde_json::to_string(&secret)?,
+            SecretsEngine::KVV2 => serde_json::to_string(&SecretContainer { data: secret })?,
         };
         let _ = self.put::<_, String>(&endpoint, Some(&json), None)?;
         Ok(())
@@ -1157,6 +1222,8 @@ where
     /// let token = "test12345";
     /// let namespace: Option<String> = None;
     /// let client = Client::new(host, token, namespace).unwrap();
+    /// let res = client.set_secret("hello_set", "world");
+    /// assert!(res.is_ok());
     /// let res = client.set_secret("hello/fred", "world");
     /// assert!(res.is_ok());
     /// let res = client.set_secret("hello/bob", "world");
@@ -1168,14 +1235,18 @@ where
     pub fn list_secrets<S: AsRef<str>>(&self, key: S) -> Result<Vec<String>> {
         let _namespace_prefix = self.namespace.as_deref().unwrap_or_default();
         let endpoint = match self.secrets_engine {
-            SecretsEngine::KVV1 => format!("/v1/{}/{}", self.secret_backend, key.as_ref()),
-            SecretsEngine::KVV2 => format!("/v1/{}/metadata/{}", self.secret_backend, key.as_ref()),
+            SecretsEngine::KVV1 => format!(
+                "/v1/{}/{}",
+                encode_path(&self.secret_backend),
+                encode_path(key.as_ref())
+            ),
+            SecretsEngine::KVV2 => format!(
+                "/v1/{}/metadata/{}",
+                encode_path(&self.secret_backend),
+                encode_path(key.as_ref())
+            ),
         };
-        let res = self.list::<_, String>(
-            &endpoint,
-            None,
-            None,
-        )?;
+        let res = self.list::<_, String>(&endpoint, None, None)?;
         let decoded: VaultResponse<ListResponse> = parse_vault_response(res)?;
         match decoded.data {
             Some(data) => Ok(data.keys),
@@ -1242,8 +1313,16 @@ where
         secret_name: S,
     ) -> Result<S2> {
         let endpoint = match self.secrets_engine {
-            SecretsEngine::KVV1 => format!("/v1/{}/{}", self.secret_backend, secret_name.as_ref()),
-            SecretsEngine::KVV2 => format!("/v1/{}/data/{}", self.secret_backend, secret_name.as_ref()),
+            SecretsEngine::KVV1 => format!(
+                "/v1/{}/{}",
+                encode_path(&self.secret_backend),
+                encode_path(secret_name.as_ref())
+            ),
+            SecretsEngine::KVV2 => format!(
+                "/v1/{}/data/{}",
+                encode_path(&self.secret_backend),
+                encode_path(secret_name.as_ref())
+            ),
         };
         let res = self.get::<_, String>(&endpoint, None)?;
         match self.secrets_engine {
@@ -1251,17 +1330,153 @@ where
                 let decoded: VaultResponse<S2> = parse_vault_response(res)?;
                 match decoded.data {
                     Some(data) => Ok(data),
-                    _ => Err(Error::Vault(format!("No secret found in response: `{:#?}`", decoded))),
+                    _ => Err(Error::Vault(format!(
+                        "No secret found in response: `{:#?}`",
+                        decoded
+                    ))),
                 }
-            },
+            }
             SecretsEngine::KVV2 => {
                 let decoded: VaultResponse<SecretDataWrapper<S2>> = parse_vault_response(res)?;
                 match decoded.data {
                     Some(data) => Ok(data.data),
-                    _ => Err(Error::Vault(format!("No secret found in response: `{:#?}`", decoded))),
+                    _ => Err(Error::Vault(format!(
+                        "No secret found in response: `{:#?}`",
+                        decoded
+                    ))),
                 }
-            },
+            }
         }
+    }
+
+    /// Fetches a specific version of a saved secret (KV v2 only)
+    pub fn get_custom_secret_version<S: AsRef<str>, S2: DeserializeOwned + fmt::Debug>(
+        &self,
+        secret_name: S,
+        version: u64,
+    ) -> Result<S2> {
+        if self.secrets_engine != SecretsEngine::KVV2 {
+            return Err(Error::Vault(
+                "Versioned read is only supported for KV v2".into(),
+            ));
+        }
+        let endpoint = format!(
+            "/v1/{}/data/{}?version={}",
+            encode_path(&self.secret_backend),
+            encode_path(secret_name.as_ref()),
+            version
+        );
+        let res = self.get::<_, String>(&endpoint, None)?;
+        let decoded: VaultResponse<SecretDataWrapper<S2>> = parse_vault_response(res)?;
+        match decoded.data {
+            Some(data) => Ok(data.data),
+            _ => Err(Error::Vault(format!(
+                "No secret version {} found in response: `{:#?}`",
+                version, decoded
+            ))),
+        }
+    }
+
+    /// Fetches metadata for a saved secret (KV v2 only)
+    pub fn get_secret_metadata<S: AsRef<str>>(&self, secret_name: S) -> Result<SecretMetadata> {
+        if self.secrets_engine != SecretsEngine::KVV2 {
+            return Err(Error::Vault(
+                "Metadata read is only supported for KV v2".into(),
+            ));
+        }
+        let endpoint = format!(
+            "/v1/{}/metadata/{}",
+            encode_path(&self.secret_backend),
+            encode_path(secret_name.as_ref())
+        );
+        let res = self.get::<_, String>(&endpoint, None)?;
+        let decoded: VaultResponse<SecretMetadata> = parse_vault_response(res)?;
+        match decoded.data {
+            Some(data) => Ok(data),
+            _ => Err(Error::Vault(format!(
+                "No metadata found in response: `{:#?}`",
+                decoded
+            ))),
+        }
+    }
+
+    /// Soft-deletes specific versions of a secret (KV v2 only)
+    pub fn delete_secret_versions<S: AsRef<str>>(
+        &self,
+        secret_name: S,
+        versions: Vec<u64>,
+    ) -> Result<()> {
+        if self.secrets_engine != SecretsEngine::KVV2 {
+            return Err(Error::Vault(
+                "Versioned delete is only supported for KV v2".into(),
+            ));
+        }
+        let endpoint = format!(
+            "/v1/{}/delete/{}",
+            encode_path(&self.secret_backend),
+            encode_path(secret_name.as_ref())
+        );
+        let body = serde_json::json!({ "versions": versions }).to_string();
+        let _ = self.post::<_, String>(&endpoint, Some(&body), None)?;
+        Ok(())
+    }
+
+    /// Undeletes specific versions of a secret (KV v2 only)
+    pub fn undelete_secret_versions<S: AsRef<str>>(
+        &self,
+        secret_name: S,
+        versions: Vec<u64>,
+    ) -> Result<()> {
+        if self.secrets_engine != SecretsEngine::KVV2 {
+            return Err(Error::Vault(
+                "Versioned undelete is only supported for KV v2".into(),
+            ));
+        }
+        let endpoint = format!(
+            "/v1/{}/undelete/{}",
+            encode_path(&self.secret_backend),
+            encode_path(secret_name.as_ref())
+        );
+        let body = serde_json::json!({ "versions": versions }).to_string();
+        let _ = self.post::<_, String>(&endpoint, Some(&body), None)?;
+        Ok(())
+    }
+
+    /// Permanently destroys specific versions of a secret (KV v2 only)
+    pub fn destroy_secret_versions<S: AsRef<str>>(
+        &self,
+        secret_name: S,
+        versions: Vec<u64>,
+    ) -> Result<()> {
+        if self.secrets_engine != SecretsEngine::KVV2 {
+            return Err(Error::Vault(
+                "Versioned destroy is only supported for KV v2".into(),
+            ));
+        }
+        let endpoint = format!(
+            "/v1/{}/destroy/{}",
+            encode_path(&self.secret_backend),
+            encode_path(secret_name.as_ref())
+        );
+        let body = serde_json::json!({ "versions": versions }).to_string();
+        let _ = self.post::<_, String>(&endpoint, Some(&body), None)?;
+        Ok(())
+    }
+
+    /// Deletes the metadata and all versions of a secret (KV v2 only)
+    pub fn delete_secret_metadata<S: AsRef<str>>(&self, secret_name: S) -> Result<()> {
+        if self.secrets_engine != SecretsEngine::KVV2 {
+            return Err(Error::Vault(
+                "Metadata deletion is only supported for KV v2".into(),
+            ));
+        }
+        let endpoint = format!(
+            "/v1/{}/metadata/{}",
+            encode_path(&self.secret_backend),
+            encode_path(secret_name.as_ref())
+        );
+        let _ = self.delete(&endpoint)?;
+        Ok(())
     }
 
     /// Fetch a wrapped secret. Token (one-time use) to fetch secret will be in `wrap_info.token`
@@ -1272,7 +1487,11 @@ where
         wrap_ttl: S2,
     ) -> Result<VaultResponse<()>> {
         let res = self.get(
-            &format!("/v1/{}/data/{}", self.secret_backend, key.as_ref())[..],
+            &format!(
+                "/v1/{}/data/{}",
+                encode_path(&self.secret_backend),
+                encode_path(key.as_ref())
+            )[..],
             Some(wrap_ttl.as_ref()),
         )?;
         parse_vault_response(res)
@@ -1296,7 +1515,7 @@ where
         role_name: S,
     ) -> Result<VaultResponse<AppRoleProperties>> {
         let res = self.get::<_, String>(
-            &format!("/v1/auth/approle/role/{}", role_name.as_ref()),
+            &format!("/v1/auth/approle/role/{}", encode_path(role_name.as_ref())),
             None,
         )?;
         parse_vault_response(res)
@@ -1323,9 +1542,10 @@ where
         plaintext: S2,
     ) -> Result<Vec<u8>> {
         let path = mountpoint.unwrap_or_else(|| "transit".to_owned());
+        let key = key.into();
         let encoded_plaintext = base64::encode(plaintext.as_ref());
         let res = self.post::<_, String>(
-            &format!("/v1/{}/encrypt/{}", path, key.into())[..],
+            &format!("/v1/{}/encrypt/{}", encode_path(&path), encode_path(&key))[..],
             Some(&format!("{{\"plaintext\": \"{}\"}}", encoded_plaintext)[..]),
             None,
         )?;
@@ -1371,9 +1591,10 @@ where
         ciphertext: S2,
     ) -> Result<Vec<u8>> {
         let path = mountpoint.unwrap_or_else(|| "transit".to_owned());
+        let key = key.into();
         let encoded_ciphertext = "vault:v1:".to_owned() + &base64::encode(ciphertext.as_ref());
         let res = self.post::<_, String>(
-            &format!("/v1/{}/decrypt/{}", path, key.into())[..],
+            &format!("/v1/{}/decrypt/{}", encode_path(&path), encode_path(&key))[..],
             Some(&format!("{{\"ciphertext\": \"{}\"}}", encoded_ciphertext)[..]),
             None,
         )?;
@@ -1470,8 +1691,20 @@ where
     /// ```
     pub fn delete_secret(&self, key: &str) -> Result<()> {
         let _ = match self.secrets_engine {
-            SecretsEngine::KVV1 => self.delete(&format!("/v1/{}/{}", self.secret_backend, key)[..])?,
-            SecretsEngine::KVV2 => self.delete(&format!("/v1/{}/data/{}", self.secret_backend, key)[..])?,
+            SecretsEngine::KVV1 => self.delete(
+                &format!(
+                    "/v1/{}/{}",
+                    encode_path(&self.secret_backend),
+                    encode_path(key)
+                )[..],
+            )?,
+            SecretsEngine::KVV2 => self.delete(
+                &format!(
+                    "/v1/{}/data/{}",
+                    encode_path(&self.secret_backend),
+                    encode_path(key)
+                )[..],
+            )?,
         };
         Ok(())
     }
@@ -1505,7 +1738,10 @@ where
     where
         K: DeserializeOwned,
     {
-        let res = self.get::<_, String>(&format!("/v1/{}/creds/{}", backend, name)[..], None)?;
+        let res = self.get(
+            &format!("/v1/{}/creds/{}", encode_path(backend), encode_path(name))[..],
+            None::<String>,
+        )?;
         let decoded: VaultResponse<K> = parse_vault_response(res)?;
         Ok(decoded)
     }
@@ -1539,7 +1775,9 @@ where
         wrap_ttl: Option<S2>,
     ) -> Result<Response> {
         let h = self.host.join(endpoint.as_ref())?;
-        let mut request = self.client.request(Method::GET, h)
+        let mut request = self
+            .client
+            .request(Method::GET, h)
             .header("X-Vault-Token", self.token.to_string())
             .header(CONTENT_TYPE, "application/json");
 
@@ -1556,7 +1794,8 @@ where
     }
 
     fn delete<S: AsRef<str>>(&self, endpoint: S) -> Result<Response> {
-        let mut request = self.client
+        let mut request = self
+            .client
             .request(Method::DELETE, self.host.join(endpoint.as_ref())?)
             .header("X-Vault-Token", self.token.to_string())
             .header(CONTENT_TYPE, "application/json");
@@ -1576,7 +1815,8 @@ where
     ) -> Result<Response> {
         let h = self.host.join(endpoint.as_ref())?;
         let body = body.unwrap_or("").to_string();
-        let mut request = self.client
+        let mut request = self
+            .client
             .request(Method::POST, h)
             .header("X-Vault-Token", self.token.to_string())
             .header(CONTENT_TYPE, "application/json");
@@ -1592,9 +1832,7 @@ where
                     .body(body)
                     .send(),
             )?),
-            None => Ok(handle_reqwest_response(
-                request.body(body).send(),
-            )?),
+            None => Ok(handle_reqwest_response(request.body(body).send())?),
         }
     }
 
@@ -1610,7 +1848,8 @@ where
         } else {
             String::new()
         };
-        let mut request = self.client
+        let mut request = self
+            .client
             .request(Method::PUT, h)
             .header("X-Vault-Token", self.token.to_string())
             .header(CONTENT_TYPE, "application/json");
@@ -1626,9 +1865,7 @@ where
                     .body(body)
                     .send(),
             )?),
-            None => Ok(handle_reqwest_response(
-                request.body(body).send(),
-            )?),
+            None => Ok(handle_reqwest_response(request.body(body).send())?),
         }
     }
 
@@ -1644,7 +1881,8 @@ where
         } else {
             String::new()
         };
-        let mut request = self.client
+        let mut request = self
+            .client
             .request(
                 Method::from_str("LIST").expect("Failed to parse LIST to Method"),
                 h,
@@ -1663,9 +1901,7 @@ where
                     .body(body)
                     .send(),
             )?),
-            None => Ok(handle_reqwest_response(
-                request.body(body).send(),
-            )?),
+            None => Ok(handle_reqwest_response(request.body(body).send())?),
         }
     }
 }

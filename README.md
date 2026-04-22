@@ -1,46 +1,57 @@
 # vault-sync
 
+> **DISCLAIMER:** This fork has been updated exclusively by an **AI Agent**. The author has no formal knowledge of Rust. While the tool has been tested and verified for specific use cases, serious care and thorough testing should be taken before using it in production environments.
+
 A tool to replicate secrets from one HashiCorp Vault or OpenBao instance to another.
 
 ## How it works
 
-When vault-sync starts, it does a full copy of the secrets from the source Vault instance to the destination Vault instance.
-Periodically, vault-sync does a full reconciliation to make sure all the destination secrets are up to date.
+When vault-sync starts, it performs a full copy of the secrets from the source Vault instance to the destination Vault instance.
 
-At the same time, you can manually enable the [Socket Audit Device](https://www.vaultproject.io/docs/audit/socket) for the source Vault,
-so Vault will be sending audit logs to vault-sync.
-Using these audit logs, vault-sync keeps the secrets in the destination Vault up to date.
+### KV v2 Full History & State Mirroring
+For KV secrets engine v2, it replicates the **entire version history**, preserving exact version numbers and matching states (live, deleted, or destroyed). 
+*   **Version Alignment (Gap-Filling)**: If the source history is truncated (e.g., versions 1-20 are purged), the tool automatically creates "destroyed placeholders" on the destination to ensure that version numbers match perfectly (e.g., both will have versions 21-30).
+*   **Self-Healing**: If a version was previously replicated as a placeholder (due to being deleted on source) and is later undeleted on the source with different content, the tool identifies the mismatch and re-syncs the secret metadata and history from scratch.
+
+### Real-Time Updates
+You can manually enable the [Socket Audit Device](https://www.vaultproject.io/docs/audit/socket) for the source Vault to stream audit logs to vault-sync. 
+*   **Priority Processing (Fast Lane / Slow Lane)**: To ensure "nearly instant" replication, the tool uses a dual-channel architecture. Audit log events (Fast Lane) always "cut the line" and are processed immediately, even if a background full synchronization is actively checking thousands of secrets (Slow Lane).
+*   **State Mirroring**: Real-time updates include replication of `delete`, `undelete`, and `destroy` operations.
+
 Note that vault-sync does not create or delete the audit devices by itself.
 
 It is possible to use the same Vault instance as the source and the destination.
-You can use this feature to replicate a "folder" of secrets to another "folder" on the same server.
 You need to specify different prefixes (`src.prefix` and `dst.prefix`) in the configuration file to make sure the source and the destination do not overlap.
+
+## Filtering
+
+You can specify a list of path patterns to ignore during synchronization using the `ignore` block in the configuration file.
+Patterns support standard glob syntax (e.g., `test/*`, `secret/**/tmp_*`).
+Ignored paths will be skipped during both the initial full sync and real-time updates via the audit device.
 
 ## Limitations
 
 * Only two Vault auth methods are supported: [Token](https://www.vaultproject.io/docs/auth/token) and [AppRole](https://www.vaultproject.io/docs/auth/approle)
-* Only secrets are replicated (specifically their latest versions)
+* For KV v2, replicating a soft-deleted version from the source results in a placeholder in the destination (since deleted data is unreadable).
+* **Special Characters**: Most special characters in secret names (including `?`, `%`, `#`, `№`) are supported via robust segment-based URL encoding.
 
 ## Configuration
 
 Use the [example](vault-sync.example.yaml) to create your own configuration file.
-Instead of specifying secrets in the configuration file, you can use environment variables:
 
-* For Token auth method:
-  * `VAULT_SYNC_SRC_TOKEN`
-  * `VAULT_SYNC_DST_TOKEN`
-* For AppRole auth method:
-  * `VAULT_SYNC_SRC_ROLE_ID`
-  * `VAULT_SYNC_SRC_SECRET_ID`
-  * `VAULT_SYNC_DST_ROLE_ID`
-  * `VAULT_SYNC_DST_SECRET_ID`
+### Logging
+The log level can be dynamically set using the `RUST_LOG` environment variable (e.g., `RUST_LOG=debug`). It defaults to `info`.
+
+### Environment Variables
+Instead of specifying secrets in the configuration file, you can use:
+* For Token auth method: `VAULT_SYNC_SRC_TOKEN`, `VAULT_SYNC_DST_TOKEN`
+* For AppRole auth method: `VAULT_SYNC_SRC_ROLE_ID`, `VAULT_SYNC_SRC_SECRET_ID`, `VAULT_SYNC_DST_ROLE_ID`, `VAULT_SYNC_DST_SECRET_ID`
 
 ### Source Vault
 
 A token or AppRole for the source Vault should have a policy that allows listing and reading secrets:
 
 For [KV secrets engine v1](https://developer.hashicorp.com/vault/docs/secrets/kv/kv-v1):
-
 ```shell
 cat <<EOF | vault policy write vault-sync-src -
 path "secret/*" {
@@ -50,7 +61,6 @@ EOF
 ```
 
 For [KV secrets engine v2](https://developer.hashicorp.com/vault/docs/secrets/kv/kv-v2):
-
 ```shell
 cat <<EOF | vault policy write vault-sync-src -
 path "secret/data/*" {
@@ -62,92 +72,27 @@ path "secret/metadata/*" {
 EOF
 ```
 
-If the secrets engine mounted to a custom path instead of "secret", then replace "secret" above with the custom path.
-
-To create a token for vault-sync for the source Vault:
-
-```shell
-vault token create -policy=vault-sync-src
-```
-
-To enable AppRole auth method and create AppRole for vault-sync for the source Vault:
-
-```shell
-# Enable approle auth method
-vault auth enable approle
-# Create a new approle and assign the policy
-vault write auth/approle/role/vault-sync-src token_policies=vault-sync-src
-# Get role id
-vault read auth/approle/role/vault-sync-src/role-id
-# Get secret id
-vault write -f auth/approle/role/vault-sync-src/secret-id
-```
-
 Enabling audit log:
-
-if you want to use the Vault audit device for vault-sync, then you need to create an audit device that always works.
-If you have only one audit device enabled, and it is not working (for example, vault-sync has terminated), then Vault will be unresponsive.
-Vault will not complete any requests until the audit device can write.
-If you have more than one audit device, then Vault will complete the request as long as one audit device persists the log.
-The simples way to create an audit device that always works:
-
 ```shell
+# Create a failsafe audit device
 vault audit enable -path stdout file file_path=stdout
-```
 
-Then, when vault-sync is running, create the audit device that will be sending audit logs to vault-sync:
-
-```shell
+# Create the socket audit device for vault-sync
 vault audit enable -path vault-sync socket socket_type=tcp address=vault-sync:8202
 ```
 
-The device name is `vault-sync`, use the same value as specified for `id` in the configuration file.
-For `address`, specify the external endpoint for vault-sync.
-Note that vault-sync should be running and accessible via the specified address, otherwise Vault will not create the audit device.
-
 ### Destination Vault
 
-A token or AppRole for the source Vault should have a policy that allows operations on secrets:
-
-For [KV secrets engine v1](https://developer.hashicorp.com/vault/docs/secrets/kv/kv-v1):
-
-```shell
-cat <<EOF | vault policy write vault-sync-dst -
-path "secret/*" {
-  capabilities = ["create", "read", "update", "delete"]
-}
-EOF
-```
-
 For [KV secrets engine v2](https://developer.hashicorp.com/vault/docs/secrets/kv/kv-v2):
-
 ```shell
 cat <<EOF | vault policy write vault-sync-dst -
 path "secret/data/*" {
   capabilities = ["create", "read", "update", "delete"]
 }
+path "secret/metadata/*" {
+  capabilities = ["create", "read", "update", "delete"]
+}
 EOF
-```
-
-If the secrets engine mounted to a custom path instead of "secret", then replace "secret" above with the custom path.
-
-To create a token for vault-sync for the source Vault:
-
-```shell
-vault token create -policy=vault-sync-dst
-```
-
-To enable AppRole auth method and create AppRole for vault-sync for the source Vault:
-
-```shell
-# Enable approle auth method
-vault auth enable approle
-# Create a new approle and assign the policy
-vault write auth/approle/role/vault-sync-dst token_policies=vault-sync-dst
-# Get role id
-vault read auth/approle/role/vault-sync-dst/role-id
-# Get secret id
-vault write -f auth/approle/role/vault-sync-dst/secret-id
 ```
 
 ## Running
@@ -158,8 +103,9 @@ vault-sync --config vault-sync.yaml
 
 Command line options:
 
-* `--dry-run` vault-sync shows all the changes it is going to make to the destination Vault, but does not do any actual changes.
-* `--once` runs the full sync once, then exits.
+* `--dry-run`: Shows proposed changes without applying them.
+* `--once`: Runs a full sync once and then exits. In this mode, port binding and audit workers are disabled.
+* `--no-full-sync`: Disables the periodic background full synchronization. The tool will rely solely on initial sync and real-time audit events.
 
 ## Installation
 
@@ -171,47 +117,24 @@ cargo build --release
 
 ### Docker
 
-Assuming your configuration file `vault-sync.yaml` is in the current directory: 
+Build the image locally:
 
 ```shell
-docker run -it -v $PWD:/vault-sync pbchekin/vault-sync:0.8.0 \
+docker build -t vault-sync:latest -f docker/Dockerfile .
+```
+
+For cross-platform builds (e.g., building `amd64` on Apple Silicon), use the cross-compilation Dockerfile:
+
+```shell
+docker build -t vault-sync:latest -f docker/Dockerfile.cross .
+```
+
+Run the container:
+
+```shell
+docker run -it -v $PWD:/vault-sync vault-sync:latest \
   vault-sync --config /vault-sync/vault-sync.yaml
 ```
 
 ### Helm chart
-
-```shell
-helm repo add vault-sync https://pbchekin.github.io/vault-sync
-helm search repo vault-sync
-# create myvalues.yaml, using install/helm/values.yaml as the example
-helm install vault-sync vault-sync/vault-sync -f myvalues.yaml
-```
-
-### Custom CA certificates
-
-When running vault-sync locally, specify environment variable `SSL_CERT_FILE` pointing to a PEM file with a certificate or certificates (see https://docs.openssl.org/3.1/man7/openssl-env/).
-
-When running vault-sync in Kubernetes, first create a Kubernetes secret from the PEM file.
-For example:
-
-```shell
-kubectl --namespace=vault-sync create secret generic certs --from-file=ca-bundle.pem=/path/to/certificate.pem
-```
-
-Then specify the following Helm chart values:
-
-```yaml
-volumes:
-  - name: certs
-    secret:
-      secretName: certs
-
-volumeMounts:
-  - mountPath: /certs
-    name: certs
-    readOnly: true
-
-environmentVars:
-  - name: SSL_CERT_FILE
-    value: /certs/ca-bundle.pem
-```
+See `install/helm/vault-sync` for the chart.

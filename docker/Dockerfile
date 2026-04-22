@@ -1,5 +1,8 @@
 FROM rust:1.93.0 AS builder
 
+# Increase stack size to prevent SIGSEGV in QEMU
+ENV RUST_MIN_STACK=16777216
+
 WORKDIR /usr/src/vault-sync
 COPY . .
 RUN cargo install --path .
